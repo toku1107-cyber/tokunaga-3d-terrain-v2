@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+_diag_*.png
+_diag_*.jpg
+_diag_*.tif
+_gh_pages/
+execution*.log
