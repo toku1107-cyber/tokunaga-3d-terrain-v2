@@ -5,3 +5,6 @@ _diag_*.jpg
 _diag_*.tif
 _gh_pages/
 execution*.log
+_backup/
+tokunaga_v21_*.png
+.playwright-mcp/

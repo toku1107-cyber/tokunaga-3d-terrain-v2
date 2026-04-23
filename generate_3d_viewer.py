@@ -49,6 +49,15 @@ print(f'  総ポイント数: {n_points:,}')
 print(f'  LAZ撮影範囲: X[{x_min:.3f},{x_max:.3f}] ({x_max-x_min:.1f}m) / Y[{y_min:.3f},{y_max:.3f}] ({y_max-y_min:.1f}m)')
 print(f'  Z: [{z_min_raw:.3f}, {z_max_raw:.3f}]')
 
+# 【VER2.1】内側高解像メッシュ用にLAZ原範囲を保存（SCENE_HALF上書き前）
+x_min_inner = x_min
+x_max_inner = x_max
+y_min_inner = y_min
+y_max_inner = y_max
+MW_INNER = x_max_inner - x_min_inner
+MH_INNER = y_max_inner - y_min_inner
+print(f'  【内側メッシュ用】LAZ原範囲 保存: {MW_INNER:.1f}m × {MH_INNER:.1f}m')
+
 # 【VER2】シーン範囲を中心±500m（1km四方）に強制上書き（広域モード）
 SCENE_HALF = 500.0  # 半径(m)
 _laz_cx = (x_min + x_max) / 2
@@ -516,6 +525,96 @@ if gsi_dem_ok:
     print(f'  標高base64更新: {len(h_b64):,} chars')
 else:
     print('  ⚠ DEM未取得 — LAZ範囲外は平均標高のフラット表示')
+
+# ==============================================================
+# Phase 3.65: 【VER2.1】内側高解像メッシュ（LAZ原範囲・VER1相当詳細）
+# ==============================================================
+print('Phase 3.65: 内側高解像メッシュ生成中（LAZ原範囲・VER1相当詳細）...')
+
+GRID_X_INNER = 1050
+GRID_Y_INNER = int(round(GRID_X_INNER * MH_INNER / MW_INNER))
+print(f'  内側グリッド: {GRID_X_INNER} × {GRID_Y_INNER} (約 {MW_INNER/GRID_X_INNER:.3f} m/セル)')
+
+GXI, GYI = GRID_X_INNER, GRID_Y_INNER
+grid_inner = np.full(GXI * GYI, -np.inf, dtype=np.float64)
+
+# LAZ再読込（原範囲のみ抽出）
+_total_inner = 0
+with laspy.open(str(LAZ_PATH)) as reader:
+    for chunk in reader.chunk_iterator(CHUNK_SIZE):
+        cx = np.array(chunk.x, dtype=np.float64)
+        cy = np.array(chunk.y, dtype=np.float64)
+        cz = np.array(chunk.z, dtype=np.float64)
+        _mi = (cx >= x_min_inner) & (cx <= x_max_inner) & (cy >= y_min_inner) & (cy <= y_max_inner)
+        cx, cy, cz = cx[_mi], cy[_mi], cz[_mi]
+        if len(cx) > 0:
+            ix = np.clip(((cx - x_min_inner) / (MW_INNER + 1e-10) * (GXI - 1)).astype(np.int32), 0, GXI - 1)
+            iy = np.clip(((cy - y_min_inner) / (MH_INNER + 1e-10) * (GYI - 1)).astype(np.int32), 0, GYI - 1)
+            np.maximum.at(grid_inner, iy * GXI + ix, cz)
+            _total_inner += len(cx)
+
+grid_inner = grid_inner.reshape(GYI, GXI)
+valid_inner = grid_inner > -np.inf
+original_valid_inner = valid_inner.copy()
+print(f'  内側LAZ点数: {_total_inner:,} / 有効セル: {valid_inner.sum():,} / {GXI*GYI:,} ({valid_inner.sum()/(GXI*GYI)*100:.1f}%)')
+
+# 内側グリッド補間（Phase 2相当・50回反復近傍平均）
+print('  内側補間中...')
+for iteration in range(50):
+    empty = ~valid_inner
+    if not empty.any():
+        break
+    padded = np.pad(grid_inner, 1, mode='constant', constant_values=-np.inf)
+    pv = np.pad(valid_inner.astype(np.float64), 1, mode='constant', constant_values=0)
+    s = np.zeros_like(grid_inner)
+    c = np.zeros_like(grid_inner)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            patch = padded[1+dy:GYI+1+dy, 1+dx:GXI+1+dx]
+            pmask = pv[1+dy:GYI+1+dy, 1+dx:GXI+1+dx]
+            s += np.where(pmask > 0, patch, 0)
+            c += pmask
+    fill_mask = empty & (c >= 2)
+    if not fill_mask.any():
+        break
+    grid_inner[fill_mask] = s[fill_mask] / c[fill_mask]
+    valid_inner |= fill_mask
+print(f'  内側補間後: {valid_inner.sum():,} セル ({valid_inner.sum()/(GXI*GYI)*100:.1f}%)')
+
+# 平滑化（3x3、3回反復）
+print('  内側平滑化中...')
+smooth_i = grid_inner.copy()
+for _ in range(3):
+    padded = np.pad(smooth_i, 1, mode='edge')
+    pv = np.pad(valid_inner.astype(np.float64), 1, mode='constant', constant_values=0)
+    s = np.zeros_like(smooth_i)
+    c = np.zeros_like(smooth_i)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            p = padded[1+dy:GYI+1+dy, 1+dx:GXI+1+dx]
+            pm = pv[1+dy:GYI+1+dy, 1+dx:GXI+1+dx]
+            s += np.where(pm > 0, p, 0)
+            c += pm
+    ok = valid_inner & (c > 0)
+    smooth_i[ok] = s[ok] / c[ok]
+grid_inner = smooth_i
+
+# 未補間セルを平均で埋める
+_hi_mean = float(grid_inner[valid_inner].mean()) if valid_inner.any() else h_mean
+grid_inner[~valid_inner] = _hi_mean
+
+grid_inner_flipped = np.flipud(grid_inner).astype(np.float32)
+mask_inner_flipped = np.flipud(original_valid_inner).astype(np.uint8)
+h_b64_inner = base64.b64encode(grid_inner_flipped.tobytes()).decode()
+m_b64_inner = base64.b64encode(mask_inner_flipped.tobytes()).decode()
+print(f'  内側base64: H={len(h_b64_inner)/1024:.0f}KB / M={len(m_b64_inner)/1024:.0f}KB')
+
+# 内側メッシュのシーン中心オフセット（LAZ中心 - シーン中心）
+INNER_OFFSET_X = _laz_cx - (x_min + x_max) / 2
+INNER_OFFSET_Y = _laz_cy - (y_min + y_max) / 2
+print(f'  内側メッシュ配置オフセット: ({INNER_OFFSET_X:.3f}, {INNER_OFFSET_Y:.3f})')
 
 # ==============================================================
 # Phase 3.7: GCP（基準点）読み込み
@@ -1206,6 +1305,7 @@ let orthoTex=null;
   orthoTex.minFilter=THREE.LinearFilter;
   orthoTex.magFilter=THREE.LinearFilter;
   omat.map=orthoTex;omat.needsUpdate=true;
+  // 【VER2.1】内側メッシュはLAZ原範囲=オルソ原範囲なのでデフォルトUV(0→1)で1:1マッピング
   console.log('オルソテクスチャ読込完了:',img.width,'x',img.height);
   applyAll();
 };img.src='data:image/jpeg;base64,'+orthoB64})();"""
@@ -1217,6 +1317,8 @@ ortho_js_color = """
         const sh0=.3+.7*hs;const sh=1-bl*(1-sh0);
         r=sh;g=sh;b=sh;
       }""" if ortho_b64 else "      r=.3;g=.3;b=.3;"
+# 【VER2.1】内側メッシュ用（同じシェーディングロジック）
+ortho_js_color_inner = ortho_js_color
 
 # 回転/スケール/フリップの操作パネル不要
 ortho_save_keys = ''
@@ -1977,6 +2079,11 @@ const M=b64u8('{m_b64}');
 const GX={GX},GY={GY},MW={MW:.4f},MH={MH:.4f};
 const HMIN={h_min:.4f},HMAX={h_max:.4f},ZC={ZC:.4f},XC=0.0000,YC=0.0000;
 const WXmin={x_min:.4f},WXmax={x_max:.4f},WYmin={y_min:.4f},WYmax={y_max:.4f};
+// 【VER2.1】内側高解像メッシュ用データ
+const HI=b64f32('{h_b64_inner}');
+const MI=b64u8('{m_b64_inner}');
+const GXI={GRID_X_INNER},GYI={GRID_Y_INNER},MW_I={MW_INNER:.4f},MH_I={MH_INNER:.4f};
+const IOX={INNER_OFFSET_X:.4f},IOY={INNER_OFFSET_Y:.4f};
 
 const scene=new THREE.Scene();scene.background=new THREE.Color(0x0d1117);
 let curBg='dark';
@@ -2088,7 +2195,27 @@ const omat=new THREE.MeshBasicMaterial({{vertexColors:true,side:THREE.DoubleSide
 const ter=new THREE.Mesh(geo,mat);scene.add(ter);
 const wM=new THREE.MeshBasicMaterial({{color:0x000000,wireframe:true,transparent:true,opacity:0.03}});
 const wir=new THREE.Mesh(geo,wM);wir.visible=false;scene.add(wir);
-window.toggleTerrain=function(v){{ter.visible=v;wir.visible=v&&document.getElementById('dMode')?.value==='wireframe'}};
+
+// 【VER2.1】内側高解像メッシュ（LAZ原範囲・VER1相当詳細・+0.02mでz-fighting回避）
+const geoI=new THREE.PlaneGeometry(MW_I,MH_I,GXI-1,GYI-1);
+const posI=geoI.attributes.position.array;
+const origZI=new Float32Array(GXI*GYI);
+for(let i=0;i<GXI*GYI;i++){{origZI[i]=HI[i]-ZC;posI[i*3+2]=origZI[i]+0.02}}
+geoI.setAttribute('color',new THREE.BufferAttribute(new Float32Array(GXI*GYI*3),3));
+const oiI=geoI.index.array,niI=[];
+for(let i=0;i<oiI.length;i+=3){{if(MI[oiI[i]]&&MI[oiI[i+1]]&&MI[oiI[i+2]])niI.push(oiI[i],oiI[i+1],oiI[i+2])}}
+geoI.setIndex(niI);geoI.computeVertexNormals();
+const terI=new THREE.Mesh(geoI,mat);
+terI.position.set(IOX,IOY,0);
+scene.add(terI);
+const wirI=new THREE.Mesh(geoI,wM);wirI.position.set(IOX,IOY,0);wirI.visible=false;scene.add(wirI);
+
+window.toggleTerrain=function(v){{
+  ter.visible=v;
+  terI.visible=v;
+  const isWire=v&&document.getElementById('dMode')?.value==='wireframe';
+  wir.visible=isWire;wirI.visible=isWire;
+}};
 
 scene.add(new THREE.AmbientLight(0x606878,0.6));
 const sn=new THREE.DirectionalLight(0xfff5e0,1);sn.position.set(40,-20,60);scene.add(sn);
@@ -2114,6 +2241,15 @@ for(let iy=1;iy<GY-1;iy++)for(let ix=1;ix<GX-1;ix++){{
   const i=iy*GX+ix;
   gx_[i]=(H[i+1]-H[i-1])/(2*cW);gy_[i]=(H[i+GX]-H[i-GX])/(2*cH);
   cv[i]=(H[i+1]+H[i-1]-2*H[i])/(cW*cW)+(H[i+GX]+H[i-GX]-2*H[i])/(cH*cH);
+}}
+
+// 【VER2.1】内側メッシュ用の微地形解析
+const cWI=MW_I/(GXI-1),cHI=MH_I/(GYI-1);
+const gxI_=new Float32Array(GXI*GYI),gyI_=new Float32Array(GXI*GYI),cvI=new Float32Array(GXI*GYI);
+for(let iy=1;iy<GYI-1;iy++)for(let ix=1;ix<GXI-1;ix++){{
+  const i=iy*GXI+ix;
+  gxI_[i]=(HI[i+1]-HI[i-1])/(2*cWI);gyI_[i]=(HI[i+GXI]-HI[i-GXI])/(2*cHI);
+  cvI[i]=(HI[i+1]+HI[i-1]-2*HI[i])/(cWI*cWI)+(HI[i+GXI]+HI[i-GXI]-2*HI[i])/(cHI*cHI);
 }}
 
 // ---- カラースキーム ----
@@ -2186,8 +2322,41 @@ function _applyAll(){{
     col[i*3]=Math.max(0,Math.min(1,r));col[i*3+1]=Math.max(0,Math.min(1,g));col[i*3+2]=Math.max(0,Math.min(1,b));
   }}
   geo.attributes.color.needsUpdate=true;
+
+  // 【VER2.1】内側メッシュの色更新（同じロジックで HI/gxI_/gyI_/cvI を使用）
+  const colI=geoI.attributes.color.array;
+  for(let i=0;i<GXI*GYI;i++){{
+    const h=HI[i];
+    const dx=gxI_[i]*mZv,dy=gyI_[i]*mZv;
+    const len=Math.sqrt(dx*dx+dy*dy+1);
+    const hs=Math.max(0,(-dx*sx-dy*sy+sz)/len);
+    const sl=Math.sqrt(dx*dx+dy*dy);
+    let r,g,b;
+    if(mode==='ortho_hs'){{
+{ortho_js_color_inner}
+    }}else if(mode==='elev_hs'){{
+      const t=Math.max(0,Math.min(1,(h-cMin)/hR));
+      [r,g,b]=schemeColor(t,sch);
+      const sh=.25+.75*hs;r*=sh;g*=sh;b*=sh;
+    }}else if(mode==='slope'){{
+      const s=Math.min(1,sl*.8);
+      [r,g,b]=schemeColor(1-s,sch);
+      const sh=.4+.6*hs;r*=sh;g*=sh;b*=sh;
+    }}else{{
+      const cn=Math.max(-1,Math.min(1,cvI[i]*mZv*500));
+      const sn2=Math.min(1,sl*1.5);
+      if(cn<0){{r=.5+.5*(-cn);g=.45*(1+cn);b=.4*(1+cn)}}
+      else{{r=.45*(1-cn);g=.45*(1-cn);b=.5+.5*cn}}
+      const gy2=.55;r=gy2+(r-gy2)*(.3+.7*sn2);g=gy2+(g-gy2)*(.3+.7*sn2);b=gy2+(b-gy2)*(.3+.7*sn2);
+      const sh=.3+.7*hs;r*=sh;g*=sh;b*=sh;
+    }}
+    colI[i*3]=Math.max(0,Math.min(1,r));colI[i*3+1]=Math.max(0,Math.min(1,g));colI[i*3+2]=Math.max(0,Math.min(1,b));
+  }}
+  geoI.attributes.color.needsUpdate=true;
+
   const isOrtho=mode==='ortho_hs';
   ter.material=isOrtho?omat:mat;
+  terI.material=isOrtho?omat:mat;
   document.getElementById('leg').style.display=isOrtho?'none':'';
   const stops=SCHEMES[sch]||SCHEMES.terrain;
   let grad='linear-gradient(to bottom,';
@@ -2207,7 +2376,7 @@ ren.domElement.addEventListener('mouseup',e=>{{
   if(e.button!==0||Math.sqrt((e.clientX-mp.x)**2+(e.clientY-mp.y)**2)>5)return;
   v2.x=(e.clientX/innerWidth)*2-1;v2.y=-(e.clientY/innerHeight)*2+1;
   rc.setFromCamera(v2,cam);
-  const hits=rc.intersectObject(ter);
+  const hits=rc.intersectObjects([terI,ter]);  // 【VER2.1】内側優先
   const tip=document.getElementById('et'),mk=document.getElementById('em');
   if(hits.length){{
     const p=hits[0].point,zs=parseFloat(document.getElementById('zS').value)||1;
