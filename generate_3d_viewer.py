@@ -2188,7 +2188,15 @@ const origZ=new Float32Array(GX*GY);
 for(let i=0;i<GX*GY;i++){{origZ[i]=H[i]-ZC;pos[i*3+2]=origZ[i]}}
 geo.setAttribute('color',new THREE.BufferAttribute(new Float32Array(GX*GY*3),3));
 const oi=geo.index.array,ni=[];
-for(let i=0;i<oi.length;i+=3){{if(M[oi[i]]&&M[oi[i+1]]&&M[oi[i+2]])ni.push(oi[i],oi[i+1],oi[i+2])}}
+// 【VER2.1-fix】外側メッシュに内側領域の穴を開ける（Z-fighting根絶）
+const _iXmin=IOX-MW_I/2,_iXmax=IOX+MW_I/2,_iYmin=IOY-MH_I/2,_iYmax=IOY+MH_I/2;
+function _inI(v){{const ix=v%GX,iy=(v/GX)|0;const wx=-MW/2+ix*MW/(GX-1),wy=MH/2-iy*MH/(GY-1);return wx>=_iXmin&&wx<=_iXmax&&wy>=_iYmin&&wy<=_iYmax}}
+for(let i=0;i<oi.length;i+=3){{
+  const a=oi[i],b=oi[i+1],c=oi[i+2];
+  if(!(M[a]&&M[b]&&M[c])) continue;
+  if(_inI(a)&&_inI(b)&&_inI(c)) continue;  // 3頂点全て内側 → スキップ（穴）
+  ni.push(a,b,c);
+}}
 geo.setIndex(ni);geo.computeVertexNormals();
 const mat=new THREE.MeshPhongMaterial({{vertexColors:true,side:THREE.DoubleSide,shininess:12}});
 const omat=new THREE.MeshBasicMaterial({{vertexColors:true,side:THREE.DoubleSide}});
